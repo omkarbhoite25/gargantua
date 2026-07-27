@@ -100,6 +100,14 @@ float fbm(vec3 p){
   v += vnoise(p * 4.11 + 23.7) * 0.125;
   return v;
 }
+/* One more octave, for the two terms that carry the disk's structure.
+   Real detail at a fourth scale beats a separate high-frequency noise
+   term, which only aliases into speckle as the disk turns. */
+float fbm4(vec3 p){
+  float v = fbm(p);
+  v += vnoise(p * 8.31 + 41.9) * 0.0625;
+  return v;
+}
 
 /* ── emission colour ───────────────────────────────────────────
    Not a Planck curve. A ramp shaped to land on the amber the plate
@@ -207,15 +215,13 @@ void diskHit(vec3 a, vec3 b, vec3 rd, inout vec3 col, inout float trans, inout f
      rotate, so the plasma boils instead of turning like a printed disc. */
   vec3 base = vec3(rp * 2.9, qr * 1.10 + uTime * 0.045);
   float warp   = fbm(base * 0.62);
-  float clump  = fbm(base + warp * 1.30);
+  float clump  = fbm4(base + warp * 1.30);
   float streak = fbm(vec3(rp * 2.2, qr *  7.0) + warp * 0.55);
-  float fine   = fbm(vec3(rp * 2.6, qr * 19.0) + warp * 0.35);
-  float grain  = vnoise(vec3(rp * 3.4, qr * 44.0) + warp);
+  float fine   = fbm(vec3(rp * 2.6, qr * 17.0) + warp * 0.35);
 
-  float tex = mix(0.60, mix(0.22, 1.80, smoothstep(0.28, 0.76, clump)),  inner);
-  tex     *= mix(0.94, mix(0.34, 1.48, smoothstep(0.30, 0.78, streak)), inner);
-  tex     *= mix(0.96, mix(0.48, 1.42, smoothstep(0.34, 0.74, fine)),   inner * sharp);
-  tex     *= mix(0.99, mix(0.74, 1.20, smoothstep(0.38, 0.68, grain)),  inner * sharp);
+  float tex = mix(0.60, mix(0.20, 1.86, smoothstep(0.28, 0.76, clump)),  inner);
+  tex     *= mix(0.94, mix(0.32, 1.52, smoothstep(0.30, 0.78, streak)), inner);
+  tex     *= mix(0.96, mix(0.46, 1.44, smoothstep(0.34, 0.74, fine)),   inner * sharp);
   tex      = mix(0.85, tex, 0.35 + 0.65 * sharp);
 
   float I = flux * 11.0 * tex * mix(0.46, 1.0, inner);
@@ -372,9 +378,12 @@ void main(){
   vec2 q = (uv - 0.5) * vec2(max(1.0, uRes.x / uRes.y), max(1.0, uRes.y / uRes.x));
   c *= 1.0 - dot(q, q) * 0.42;
 
-  /* a grain floor, so the deep black never bands on 8-bit panels */
-  float g = fract(sin(dot(gl_FragCoord.xy + uTime * 60.0, vec2(12.9898, 78.233))) * 43758.5453);
-  c += (g - 0.5) * 0.006;
+  /* A fixed ordered dither, not per-frame noise. Random grain regenerated
+     every frame is what reads as crawling static across the black; an R2
+     low-discrepancy pattern that never changes breaks up 8-bit banding
+     just as well and is completely still. */
+  float d = fract(dot(gl_FragCoord.xy, vec2(0.7548776662, 0.5698402909)));
+  c += (d - 0.5) * 0.0040;
 
   outColor = vec4(pow(max(c, 0.0), vec3(1.0 / 2.2)), 1.0);
 }
@@ -619,15 +628,18 @@ function frame(now){
      Climbing needs a long clean run; dropping happens fast. Once it has
      dropped it will not try to climb again, so a machine that is merely
      busy for a moment cannot start oscillating the resolution. */
-  if (!settled && t > 1.2){
-    if (since > BUDGET_MS * 1.55){
+  if (t > 1.2){
+    if (since > BUDGET_MS * 1.35){
+      /* Dropping is always allowed, even long after the ladder has settled.
+         A machine that throttles, or that picks up load from another tab,
+         has to be able to give quality back. */
       fast = 0;
       if (++slow > 10){
         slow = 0;
         if (tier < TIERS.length - 1){ tier++; resize(); }
-        settled = tried > 0;                /* had climbed, so this is the ceiling */
+        if (tried > 0) settled = true;      /* it climbed too far; stop trying */
       }
-    } else if (since < BUDGET_MS * 1.15){
+    } else if (!settled && since < BUDGET_MS * 1.15){
       slow = 0;
       if (++fast > 90){
         fast = 0;
