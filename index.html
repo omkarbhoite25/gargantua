@@ -292,9 +292,12 @@ void main(){
        punch through the disk plane twice inside one step, so refine there
        and test each substep separately. Testing only the whole step is
        what leaves the Einstein ring drawn as a dashed line. */
-    bool near = r < 5.2;
-    float h = near ? dt * 0.5 : dt;
-    for (int k = 0; k < 2; k++){
+    int sub = 1;
+    if (r < 5.2) sub = 2;
+    if (r < 3.4) sub = 4;          /* rays winding the photon sphere */
+    float h = dt / float(sub);
+    for (int k = 0; k < 4; k++){
+      if (k >= sub) break;
       vec3 s0 = pos;
       vec3 a0 = accAt(pos, vel);
       vec3 pm = pos + vel * (h * 0.5);
@@ -302,7 +305,6 @@ void main(){
       pos += vm * h;
       vel += accAt(pm, vm) * h;
       diskHit(s0, pos, rd, col, trans, nCross);
-      if (!near) break;
     }
 
     if (trans < 0.02){ trans = 0.0; break; }
@@ -349,8 +351,9 @@ precision highp float;
 out vec4 outColor;
 uniform sampler2D uScene;
 uniform sampler2D uBloomA;   /* tight, quarter res    */
-uniform sampler2D uBloomB;   /* wide, sixteenth res   */
+uniform sampler2D uBloomB;   /* wide, eighth res      */
 uniform vec2  uRes;
+uniform vec2  uSceneTexel;
 uniform float uTime;
 
 vec3 aces(vec3 x){
@@ -360,15 +363,22 @@ void main(){
   vec2 uv = gl_FragCoord.xy / uRes;
 
   vec3 c = texture(uScene,  uv).rgb;
-  vec3 a = texture(uBloomA, uv).rgb;
-  vec3 b = texture(uBloomB, uv).rgb;
 
-  /* The wide pass carries the far haze the raytracer stops short of,
-     and it is stretched horizontally, so the disk bleeds along its own
-     axis the way a real anamorphic lens would smear it. */
-  c += a * 0.70 + b * 1.45;
+  /* Unsharp mask against the ray pass itself. The geodesic image is clean
+     and noise-free, so this recovers the filament edges the downsample and
+     the bloom soften, and costs four fetches. */
+  vec2 t = uSceneTexel;
+  vec3 lo = (texture(uScene, uv + vec2( t.x, 0.0)).rgb
+           + texture(uScene, uv + vec2(-t.x, 0.0)).rgb
+           + texture(uScene, uv + vec2(0.0,  t.y)).rgb
+           + texture(uScene, uv + vec2(0.0, -t.y)).rgb) * 0.25;
+  c += (c - lo) * 0.42;
 
-  c = aces(c * 1.05);
+  /* Bloom is a garnish, not the image. Carrying it at the strength this
+     had before is exactly what makes a render read as soft and dated. */
+  c += texture(uBloomA, uv).rgb * 0.26 + texture(uBloomB, uv).rgb * 0.34;
+
+  c = aces(max(c, 0.0) * 1.08);
 
   /* a light S-curve: hold the blacks down, let the hot limb run */
   c = c * c * (3.0 - 2.0 * c) * 0.18 + c * 0.82;
@@ -469,40 +479,67 @@ const wideA = makeTarget();   /* sixteenth res, wide anamorphic bloom */
 const wideB = makeTarget();
 
 /* ── budget ──────────────────────────────────────────────────
-   Nothing on screen moves fast enough to need 60fps: the camera
-   drifts at 0.02 rad/s. Rendering at 30 halves the GPU bill and
-   is invisible. Resolution and step count then adapt on top.
-   ─────────────────────────────────────────────────────────── */
-const TARGET_FPS = 30;
-const BUDGET_MS  = 1000 / TARGET_FPS;
+   Quality is measured on the visitor's machine, never assumed from
+   it. Everyone starts mid-ladder so the first seconds are smooth on
+   a phone, then the page climbs as high as the device sustains.
 
-/* Quality is measured on the visitor's machine, never assumed from it.
-   Everyone starts mid-ladder so the first seconds are smooth on a phone,
-   then the page climbs as high as the device actually sustains and stops.
-   A workstation ends at tier 0; a weak laptop settles near the bottom;
-   neither needs to be detected or special-cased. */
+   scale multiplies *device* pixels, so 1.00 is already native on a
+   retina panel and 1.60 is real supersampling on top of that.
+
+   Note the middle of the ladder. Rather than blurring the image the
+   moment a machine misses 30fps, it first spends frame rate and holds
+   native resolution. For a background whose camera drifts at 0.02
+   rad/s, 20fps is nearly impossible to notice and a soft upscale is
+   impossible to miss. Resolution is surrendered last, not first.
+
+   Frame rates here are only ever divisors of 60. The frame gate can only
+   release on a vsync boundary, so asking for 24 on a 60Hz panel actually
+   delivers 20 and leaves the ladder stuck in a dead zone, judging itself
+   against a target it can never reach.
+   ─────────────────────────────────────────────────────────── */
 const TIERS = [
-  { scale: 1.30, steps: 260 },   /* supersampled */
-  { scale: 1.00, steps: 230 },   /* native */
-  { scale: 0.82, steps: 195 },
-  { scale: 0.66, steps: 165 },
-  { scale: 0.52, steps: 135 },
-  { scale: 0.40, steps: 105 }
+  { scale: 1.60, steps: 300, fps: 30 },
+  { scale: 1.30, steps: 275, fps: 30 },
+  { scale: 1.00, steps: 240, fps: 30 },   /* native device pixels */
+  { scale: 1.00, steps: 240, fps: 20 },   /* hold native, spend frame rate */
+  { scale: 0.82, steps: 205, fps: 20 },
+  { scale: 0.66, steps: 175, fps: 20 },
+  { scale: 0.52, steps: 145, fps: 20 },
+  { scale: 0.40, steps: 110, fps: 20 }
 ];
-let tier = 3;
+let tier = 4;
+let TARGET_FPS = TIERS[tier].fps;
+let BUDGET_MS  = 1000 / TARGET_FPS;
+
+const MAX_TEX = gl.getParameter(gl.MAX_TEXTURE_SIZE);
+const MAX_PX  = 14e6;          /* keeps VRAM and fill rate sane at 5K */
 let W = 0, H = 0, bw = 0, bh = 0, ww = 0, wh = 0;
 
 function resize(){
-  const dpr = Math.min(devicePixelRatio || 1, 1.25);
+  /* Full device pixel ratio. Capping it at 1.25, as this did, is what makes
+     a render look soft on a retina panel no matter how good the shader is. */
+  const dpr = Math.min(devicePixelRatio || 1, 3);
   const vw = Math.max(1, Math.round(innerWidth  * dpr));
   const vh = Math.max(1, Math.round(innerHeight * dpr));
   canvas.width = vw; canvas.height = vh;
 
+  TARGET_FPS = TIERS[tier].fps;
+  BUDGET_MS  = 1000 / TARGET_FPS;
+  winStart = 0; winFrames = 0;          /* the old window measured a different budget */
+
   const s = TIERS[tier].scale;
-  W = Math.max(2, Math.round(vw * s));
-  H = Math.max(2, Math.round(vh * s));
+  let rw = vw * s, rh = vh * s;
+
+  /* clamp to what the driver and the memory budget will actually take */
+  const k = Math.min(1,
+    Math.sqrt(MAX_PX / (rw * rh)),
+    MAX_TEX / rw,
+    MAX_TEX / rh);
+  W = Math.max(2, Math.round(rw * k));
+  H = Math.max(2, Math.round(rh * k));
+
   bw = Math.max(2, W >> 2);  bh = Math.max(2, H >> 2);
-  ww = Math.max(2, W >> 4);  wh = Math.max(2, H >> 4);
+  ww = Math.max(2, W >> 3);  wh = Math.max(2, H >> 3);
 
   sizeTarget(scene, W, H);
   sizeTarget(pingA, bw, bh);
@@ -546,7 +583,8 @@ function bind(prog, target, w, h){
   gl.viewport(0, 0, w, h);
 }
 
-let raf = 0, t0 = 0, lastDraw = 0, slow = 0, fast = 0, tried = 0, settled = false;
+let raf = 0, t0 = 0, lastDraw = 0, tried = 0, settled = false;
+let winStart = 0, winFrames = 0, good = 0, bad = 0;
 
 function frame(now){
   raf = requestAnimationFrame(frame);
@@ -593,13 +631,12 @@ function frame(now){
   gl.uniform1f(BLUR.u.uThresh, 0);
   gl.drawArrays(gl.TRIANGLES, 0, 3);
 
-  /* 4 · a second, far wider pass at sixteenth res, stretched along x.
-         This is the haze that sells the scale of the thing, and at
-         1/256 of the pixels it is effectively free. */
+  /* 4 · a second, wider pass at eighth res, lightly stretched along x so
+         the disk bleeds along its own axis rather than into a round haze */
   bind(BLUR, wideA, ww, wh);
   gl.bindTexture(gl.TEXTURE_2D, pingB.tex);
   gl.uniform2f(BLUR.u.uTexel, 1 / bw, 1 / bh);
-  gl.uniform2f(BLUR.u.uDir, 3.4, 0);
+  gl.uniform2f(BLUR.u.uDir, 2.2, 0);
   gl.drawArrays(gl.TRIANGLES, 0, 3);
 
   bind(BLUR, wideB, ww, wh);
@@ -620,31 +657,47 @@ function frame(now){
   gl.bindTexture(gl.TEXTURE_2D, wideB.tex);
   gl.uniform1i(COMP.u.uBloomB, 2);
   gl.uniform2f(COMP.u.uRes, canvas.width, canvas.height);
+  gl.uniform2f(COMP.u.uSceneTexel, 1 / W, 1 / H);
   gl.uniform1f(COMP.u.uTime, t);
   gl.drawArrays(gl.TRIANGLES, 0, 3);
 
-  /* Judge the device by whether it actually delivered the frame budget,
-     not by how long JS took to queue the calls, and not by core count.
-     Climbing needs a long clean run; dropping happens fast. Once it has
-     dropped it will not try to climb again, so a machine that is merely
-     busy for a moment cannot start oscillating the resolution. */
-  if (t > 1.2){
-    if (since > BUDGET_MS * 1.35){
-      /* Dropping is always allowed, even long after the ladder has settled.
-         A machine that throttles, or that picks up load from another tab,
-         has to be able to give quality back. */
-      fast = 0;
-      if (++slow > 10){
-        slow = 0;
+  /* Measure throughput over a whole second, not the gap between two frames.
+     The gap is quantised to the vsync interval, so it happily reads a
+     healthy 33.3ms while the GPU is actually only completing 16 frames a
+     second. Counting frames against the wall clock cannot be fooled that
+     way, and it is the number that actually matters. */
+  winFrames++;
+  if (!winStart) winStart = now;
+  else if (now - winStart >= 1000){
+    const fps = winFrames * 1000 / (now - winStart);
+    winStart = now; winFrames = 0;
+    __gq.fps = +fps.toFixed(1);
+
+    if (t > 2.0){
+      if (fps < TARGET_FPS * 0.60){
+        /* badly over budget, give quality back immediately */
+        good = bad = 0;
         if (tier < TIERS.length - 1){ tier++; resize(); }
-        if (tried > 0) settled = true;      /* it climbed too far; stop trying */
-      }
-    } else if (!settled && since < BUDGET_MS * 1.15){
-      slow = 0;
-      if (++fast > 90){
-        fast = 0;
-        if (tier > 0){ tier--; tried++; resize(); }
-        else settled = true;
+        if (tried > 0) settled = true;
+      } else if (fps < TARGET_FPS * 0.80){
+        good = 0;
+        if (++bad >= 2){
+          bad = 0;
+          if (tier < TIERS.length - 1){ tier++; resize(); }
+          if (tried > 0) settled = true;   /* it climbed too far; stop trying */
+        }
+      } else if (fps > TARGET_FPS * 0.90){
+        /* Dropping stays available forever, so a machine that throttles or
+           picks up load from another tab can still give resolution back.
+           Only climbing is locked out once it has found its ceiling. */
+        bad = 0;
+        if (!settled && ++good >= 3){
+          good = 0;
+          if (tier > 0){ tier--; tried++; resize(); }
+          else settled = true;
+        }
+      } else {
+        good = bad = 0;
       }
     }
   }
@@ -656,7 +709,7 @@ function frame(now){
 
 /* a small handle for profiling and for tuning tiers from the console */
 const __gq = window.__gq = {
-  n: 0, tier, w: 0, h: 0, since: 0, TIERS,
+  n: 0, tier, w: 0, h: 0, since: 0, fps: 0, TIERS,
   set(i){ tier = i; settled = true; resize(); }
 };
 

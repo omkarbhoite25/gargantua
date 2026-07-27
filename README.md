@@ -40,26 +40,38 @@ On top of that:
 
 ## Performance
 
-It renders at 30fps on purpose. The camera drifts at 0.02 rad/s, so nothing on
-screen moves fast enough to need 60, and holding half the frame rate halves the
-GPU cost for no visible difference.
-
 Quality is **measured on the visitor's machine, never assumed from it.** Everyone
 starts mid-ladder, and the page then climbs as high as the device actually
-sustains and stops:
+sustains and stops. There is no user-agent sniffing anywhere in the file.
 
-| Tier | Scale | Steps |
-| ---- | ----- | ----- |
-| 0    | 1.30× | 260   |
-| 1    | 1.00× | 230   |
-| 2    | 0.82× | 195   |
-| 3    | 0.66× | 165   |
-| 4    | 0.52× | 135   |
-| 5    | 0.40× | 105   |
+| Tier | Scale | Steps | FPS |
+| ---- | ----- | ----- | --- |
+| 0    | 1.60x | 300   | 30  |
+| 1    | 1.30x | 275   | 30  |
+| 2    | 1.00x | 240   | 30  |
+| 3    | 1.00x | 240   | 20  |
+| 4    | 0.82x | 205   | 20  |
+| 5    | 0.66x | 175   | 20  |
+| 6    | 0.52x | 145   | 20  |
+| 7    | 0.40x | 110   | 20  |
 
-A workstation settles at tier 0 with supersampling. A weak laptop settles near
-the bottom. Neither is detected or special-cased, and there is no user-agent
-sniffing anywhere in the file.
+Scale multiplies *device* pixels, so 1.00 is already native on a retina panel
+and 1.60 is real supersampling on top of that.
+
+Two things in that table are deliberate:
+
+- **Tier 3 holds native resolution and spends frame rate instead.** For a
+  background whose camera drifts at 0.02 rad/s, 20fps is nearly impossible to
+  notice and a soft upscale is impossible to miss. Resolution is surrendered
+  last, not first.
+- **Every frame rate is a divisor of 60.** The frame gate can only release on a
+  vsync boundary, so asking a 60Hz panel for 24fps actually delivers 20 and
+  leaves the ladder judging itself against a target it can never reach.
+
+Throughput is measured over a full second against the wall clock, not as the gap
+between two frames. That gap is quantised to the vsync interval, so it will
+happily read a healthy 33.3ms while the GPU is only completing 16 frames a
+second.
 
 Also: the render pauses when the tab is hidden, survives WebGL context loss, and
 widens its field of view as the frame narrows so the whole system stays in shot
